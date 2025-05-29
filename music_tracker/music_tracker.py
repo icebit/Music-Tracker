@@ -102,6 +102,8 @@ class MusicTracker:
         conn.commit()
         conn.close()
     
+    
+    
     def detect_daw_projects(self, directory: str) -> List[Dict]:
         """Scan directory for DAW project files and return project info"""
         projects = []
@@ -115,7 +117,7 @@ class MusicTracker:
         daw_patterns = {
             '.flp': 'FL Studio',
             '.logicx': 'Logic Pro',
-            '.song': 'Studio One', 
+            '.song': 'Studio One',
             '.bwproject': 'Bitwig'
         }
         
@@ -177,7 +179,19 @@ class MusicTracker:
         try:
             file_stat = project_file.stat()
             file_size_mb = file_stat.st_size / (1024 * 1024)
-            date_created = datetime.fromtimestamp(file_stat.st_ctime).date()
+            
+            # On macOS, get the actual creation time using birthtime
+            try:
+                if hasattr(file_stat, 'st_birthtime'):
+                    # macOS/BSD - use birth time (actual creation time)
+                    date_created = datetime.fromtimestamp(file_stat.st_birthtime).date()
+                else:
+                    # Linux/Windows fallback
+                    date_created = datetime.fromtimestamp(file_stat.st_ctime).date()
+            except (OSError, ValueError):
+                # Fallback if birthtime fails
+                date_created = datetime.fromtimestamp(file_stat.st_ctime).date()
+            
             date_modified = datetime.fromtimestamp(file_stat.st_mtime).date()
             
             project_folder = None
@@ -187,15 +201,14 @@ class MusicTracker:
             if extension in ['.song', '.bwproject']:
                 # These are always in project folders
                 project_folder = project_file.parent
-                # Use folder name as title if different from file name
-                if project_folder.name != project_file.stem:
-                    detected_title = project_folder.name
+                # Use folder name as title
+                detected_title = project_folder.name
             
             elif extension == '.logicx':
                 # Logic projects might be in folders or standalone packages
                 parent_dir = project_file.parent
                 # If parent folder name suggests it's a project folder
-                if (parent_dir.name == project_file.stem or 
+                if (parent_dir.name == project_file.stem or
                     any(sibling.name.startswith(project_file.stem) for sibling in parent_dir.iterdir() if sibling != project_file)):
                     project_folder = parent_dir
                     detected_title = parent_dir.name
@@ -206,7 +219,7 @@ class MusicTracker:
             additional_files = []
             if project_folder:
                 for item in project_folder.iterdir():
-                    if item != project_file and item.is_file():
+                    if item != project_file and item.is_file() and not item.name.startswith('.'):
                         additional_files.append(item.name)
             
             return {
@@ -221,7 +234,7 @@ class MusicTracker:
             }
             
         except Exception as e:
-            print(f"⚠️  Error analyzing {project_file}: {e}")
+            print(f"Error analyzing {project_file}: {e}")
             return None
     
     def add_directory(self, directory: str) -> int:
@@ -264,6 +277,32 @@ class MusicTracker:
         
         print(f"\nAdded {added_count} new projects to raw database")
         return added_count
+    
+    def list_raw_projects(self, limit: int = 20, offset: int = 0, daw_filter: str = None) -> List[Dict]:
+        """List unprocessed raw projects"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        query = '''
+            SELECT id, detected_title, daw_type, file_size_mb, date_created, project_file_path
+            FROM raw_projects 
+            WHERE id NOT IN (SELECT raw_project_id FROM refined_projects WHERE raw_project_id IS NOT NULL)
+            AND id NOT IN (SELECT raw_project_id FROM rejected_projects WHERE raw_project_id IS NOT NULL)
+        '''
+        params = []
+        
+        if daw_filter:
+            query += ' AND daw_type LIKE ?'
+            params.append(f'%{daw_filter}%')
+        
+        query += ' ORDER BY date_discovered DESC LIMIT ? OFFSET ?'
+        params.extend([limit, offset])
+        
+        cursor.execute(query, params)
+        results = cursor.fetchall()
+        conn.close()
+        
+        return [dict(zip(['id', 'title', 'daw', 'size_mb', 'created', 'path'], row)) for row in results]
     
     def list_refined_projects(self, limit: int = 20, offset: int = 0, daw_filter: str = None) -> List[Dict]:
         """List refined/curated projects"""
@@ -671,6 +710,74 @@ class MusicTracker:
             for daw, count in daw_stats:
                 print(f"   {daw}: {count}")
 
+    def fix_creation_dates(self):
+        """Update creation dates in database using correct birthtime"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        # Fix raw projects
+        cursor.execute('SELECT id, project_file_path FROM raw_projects')
+        raw_projects = cursor.fetchall()
+        
+        print(f"Fixing creation dates for {len(raw_projects)} raw projects...")
+        
+        for project_id, file_path in raw_projects:
+            try:
+                if os.path.exists(file_path):
+                    file_stat = os.stat(file_path)
+                    
+                    # Get correct creation time
+                    if hasattr(file_stat, 'st_birthtime'):
+                        date_created = datetime.fromtimestamp(file_stat.st_birthtime).date()
+                    else:
+                        date_created = datetime.fromtimestamp(file_stat.st_ctime).date()
+                    
+                    cursor.execute('''
+                        UPDATE raw_projects 
+                        SET date_created = ? 
+                        WHERE id = ?
+                    ''', (date_created, project_id))
+                    
+                    print(f"Updated raw project {project_id}: {date_created}")
+                else:
+                    print(f"File not found, skipping: {file_path}")
+                    
+            except Exception as e:
+                print(f"Error updating project {project_id}: {e}")
+        
+        # Fix refined projects
+        cursor.execute('SELECT id, project_file_path FROM refined_projects')
+        refined_projects = cursor.fetchall()
+        
+        print(f"Fixing creation dates for {len(refined_projects)} refined projects...")
+        
+        for project_id, file_path in refined_projects:
+            try:
+                if os.path.exists(file_path):
+                    file_stat = os.stat(file_path)
+                    
+                    # Get correct creation time
+                    if hasattr(file_stat, 'st_birthtime'):
+                        date_created = datetime.fromtimestamp(file_stat.st_birthtime).date()
+                    else:
+                        date_created = datetime.fromtimestamp(file_stat.st_ctime).date()
+                    
+                    cursor.execute('''
+                        UPDATE refined_projects 
+                        SET date_created = ? 
+                        WHERE id = ?
+                    ''', (date_created, project_id))
+                    
+                    print(f"Updated refined project {project_id}: {date_created}")
+                else:
+                    print(f"File not found, skipping: {file_path}")
+                    
+            except Exception as e:
+                print(f"Error updating project {project_id}: {e}")
+        
+        conn.commit()
+        conn.close()
+        print("Creation date fix complete!")
 
 def main():
     parser = argparse.ArgumentParser(description="Advanced Music Project Tracker")
@@ -716,6 +823,9 @@ def main():
     reject_parser = subparsers.add_parser('reject', help='Reject a project')
     reject_parser.add_argument('id', type=int, help='Raw project ID')
     reject_parser.add_argument('--reason', default='Not useful', help='Rejection reason')
+    
+    # Fix dates command
+    subparsers.add_parser('fix-dates', help='Fix creation dates in existing database')
     
     # Stats command
     subparsers.add_parser('stats', help='Show database statistics')
@@ -776,10 +886,14 @@ def main():
     elif args.command == 'stats':
         tracker.stats()
     
+    elif args.command == 'fix-dates':
+        tracker.fix_creation_dates()
+
     elif args.command == 'version':
         print(f"Music Tracker v{__version__}")
         print("Advanced CLI tool for tracking DAW music projects")
         print(f"Database location: {tracker.db_path}")
+
 
 
 if __name__ == '__main__':
