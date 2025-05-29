@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Advanced Music Project Tracker CLI Tool
 Tracks DAW projects across multiple stages: raw discovery -> refined catalog -> rejected
@@ -101,8 +100,6 @@ class MusicTracker:
         
         conn.commit()
         conn.close()
-    
-    
     
     def detect_daw_projects(self, directory: str) -> List[Dict]:
         """Scan directory for DAW project files and return project info"""
@@ -278,32 +275,6 @@ class MusicTracker:
         print(f"\nAdded {added_count} new projects to raw database")
         return added_count
     
-    def list_raw_projects(self, limit: int = 20, offset: int = 0, daw_filter: str = None) -> List[Dict]:
-        """List unprocessed raw projects"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        query = '''
-            SELECT id, detected_title, daw_type, file_size_mb, date_created, project_file_path
-            FROM raw_projects 
-            WHERE id NOT IN (SELECT raw_project_id FROM refined_projects WHERE raw_project_id IS NOT NULL)
-            AND id NOT IN (SELECT raw_project_id FROM rejected_projects WHERE raw_project_id IS NOT NULL)
-        '''
-        params = []
-        
-        if daw_filter:
-            query += ' AND daw_type LIKE ?'
-            params.append(f'%{daw_filter}%')
-        
-        query += ' ORDER BY date_discovered DESC LIMIT ? OFFSET ?'
-        params.extend([limit, offset])
-        
-        cursor.execute(query, params)
-        results = cursor.fetchall()
-        conn.close()
-        
-        return [dict(zip(['id', 'title', 'daw', 'size_mb', 'created', 'path'], row)) for row in results]
-    
     def list_refined_projects(self, limit: int = 20, offset: int = 0, daw_filter: str = None) -> List[Dict]:
         """List refined/curated projects"""
         conn = sqlite3.connect(self.db_path)
@@ -410,6 +381,18 @@ class MusicTracker:
             project_data['additional_files'] = json.loads(project_data['additional_files'])
         
         return project_data
+    
+    def run_analytics(self):
+        """Run analytics module"""
+        try:
+            from . import music_analytics
+            analytics = music_analytics.MusicAnalytics(self.db_path)
+            analytics.generate_report()
+        except ImportError:
+            print("Analytics dependencies not installed!")
+            print("Install with: pip install pandas matplotlib seaborn plotly numpy")
+        except Exception as e:
+            print(f"Error running analytics: {e}")
     
     def refine_project(self, raw_id: int, **metadata) -> bool:
         """Move project from raw to refined with additional metadata"""
@@ -710,105 +693,6 @@ class MusicTracker:
             for daw, count in daw_stats:
                 print(f"   {daw}: {count}")
 
-    def reject_project(self, raw_id: int, reason: str = "Not useful") -> bool:
-        """Move project to rejected database"""
-        raw_project = self.show_project_details(raw_id)
-        if not raw_project:
-            print(f"Raw project {raw_id} not found")
-            return False
-        
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        try:
-            cursor.execute('''
-                INSERT INTO rejected_projects
-                (raw_project_id, reason, project_file_path, detected_title, daw_type)
-                VALUES (?, ?, ?, ?, ?)
-            ''', (
-                raw_id, reason, raw_project['project_file_path'],
-                raw_project['detected_title'], raw_project['daw_type']
-            ))
-            
-            conn.commit()
-            conn.close()
-            print(f"Rejected: {raw_project['detected_title']} - {reason}")
-            return True
-            
-        except Exception as e:
-            conn.rollback()
-            conn.close()
-            print(f"Error rejecting project: {e}")
-            return False
-
-    def fix_creation_dates(self):
-        """Update creation dates in database using correct birthtime"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        # Fix raw projects
-        cursor.execute('SELECT id, project_file_path FROM raw_projects')
-        raw_projects = cursor.fetchall()
-        
-        print(f"Fixing creation dates for {len(raw_projects)} raw projects...")
-        
-        for project_id, file_path in raw_projects:
-            try:
-                if os.path.exists(file_path):
-                    file_stat = os.stat(file_path)
-                    
-                    # Get correct creation time
-                    if hasattr(file_stat, 'st_birthtime'):
-                        date_created = datetime.fromtimestamp(file_stat.st_birthtime).date()
-                    else:
-                        date_created = datetime.fromtimestamp(file_stat.st_ctime).date()
-                    
-                    cursor.execute('''
-                        UPDATE raw_projects 
-                        SET date_created = ? 
-                        WHERE id = ?
-                    ''', (date_created, project_id))
-                    
-                    print(f"Updated raw project {project_id}: {date_created}")
-                else:
-                    print(f"File not found, skipping: {file_path}")
-                    
-            except Exception as e:
-                print(f"Error updating project {project_id}: {e}")
-        
-        # Fix refined projects
-        cursor.execute('SELECT id, project_file_path FROM refined_projects')
-        refined_projects = cursor.fetchall()
-        
-        print(f"Fixing creation dates for {len(refined_projects)} refined projects...")
-        
-        for project_id, file_path in refined_projects:
-            try:
-                if os.path.exists(file_path):
-                    file_stat = os.stat(file_path)
-                    
-                    # Get correct creation time
-                    if hasattr(file_stat, 'st_birthtime'):
-                        date_created = datetime.fromtimestamp(file_stat.st_birthtime).date()
-                    else:
-                        date_created = datetime.fromtimestamp(file_stat.st_ctime).date()
-                    
-                    cursor.execute('''
-                        UPDATE refined_projects 
-                        SET date_created = ? 
-                        WHERE id = ?
-                    ''', (date_created, project_id))
-                    
-                    print(f"Updated refined project {project_id}: {date_created}")
-                else:
-                    print(f"File not found, skipping: {file_path}")
-                    
-            except Exception as e:
-                print(f"Error updating project {project_id}: {e}")
-        
-        conn.commit()
-        conn.close()
-        print("Creation date fix complete!")
 
 def main():
     parser = argparse.ArgumentParser(description="Advanced Music Project Tracker")
@@ -855,14 +739,14 @@ def main():
     reject_parser.add_argument('id', type=int, help='Raw project ID')
     reject_parser.add_argument('--reason', default='Not useful', help='Rejection reason')
     
-    # Fix dates command
-    subparsers.add_parser('fix-dates', help='Fix creation dates in existing database')
-    
     # Stats command
     subparsers.add_parser('stats', help='Show database statistics')
     
     # Version command
     subparsers.add_parser('version', help='Show version information')
+    
+    # Analytics command
+    subparsers.add_parser('analytics', help='Run analytics and generate visualizations')
     
     args = parser.parse_args()
     
@@ -917,14 +801,13 @@ def main():
     elif args.command == 'stats':
         tracker.stats()
     
-    elif args.command == 'fix-dates':
-        tracker.fix_creation_dates()
-
     elif args.command == 'version':
         print(f"Music Tracker v{__version__}")
         print("Advanced CLI tool for tracking DAW music projects")
         print(f"Database location: {tracker.db_path}")
-
+    
+    elif args.command == 'analytics':
+        tracker.run_analytics()
 
 
 if __name__ == '__main__':
