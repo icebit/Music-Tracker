@@ -710,6 +710,37 @@ class MusicTracker:
             for daw, count in daw_stats:
                 print(f"   {daw}: {count}")
 
+    def reject_project(self, raw_id: int, reason: str = "Not useful") -> bool:
+        """Move project to rejected database"""
+        raw_project = self.show_project_details(raw_id)
+        if not raw_project:
+            print(f"Raw project {raw_id} not found")
+            return False
+        
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        try:
+            cursor.execute('''
+                INSERT INTO rejected_projects
+                (raw_project_id, reason, project_file_path, detected_title, daw_type)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (
+                raw_id, reason, raw_project['project_file_path'],
+                raw_project['detected_title'], raw_project['daw_type']
+            ))
+            
+            conn.commit()
+            conn.close()
+            print(f"Rejected: {raw_project['detected_title']} - {reason}")
+            return True
+            
+        except Exception as e:
+            conn.rollback()
+            conn.close()
+            print(f"Error rejecting project: {e}")
+            return False
+
     def fix_creation_dates(self):
         """Update creation dates in database using correct birthtime"""
         conn = sqlite3.connect(self.db_path)
